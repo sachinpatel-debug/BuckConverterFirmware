@@ -34,16 +34,20 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 //#define VREFINT_CAL_ADDR ((uint16_t*) ((uint32_t)0x1FF80078))
-#define B0 (+0.779117472615)
-#define B1 (-0.695393105007)
-#define B2 (-0.777954915806)
-#define B3 (+0.696555661817)
-#define A1 (+1.301778583106)
-#define A2 (-0.185476661785)
-#define A3 (-0.116301921321)
-#define K (+0.692469006110)
+#define B0 (+0.072843308)
+#define B1 (-0.068984401)
+#define B2 (-0.072799692)
+#define B3 (+0.069028018)
+#define A1 (+.100346303)
+#define A2 (0.004660361)  //I have scaled everything by 1/10
+#define A3 (-0.005006664)
+#define K (+0.001007325)
+#define K_NO_PWM (0.41972)
 #define DUTY_TICKS_MIN (0)
-#define DUTY_TICKS_MAX (72)
+#define DUTY_TICKS_MAX (40) //given by 0.8*arr_val (which is 50)
+#define PARAM_VREF 2482
+#define Kp 0.0015
+#define Ki 0.00003
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -76,19 +80,31 @@ static void MX_USART1_UART_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-int period = 79; //specifies the pwm period by telling mcu what value to count up to
-uint16_t ADC_Val[2]; //0 is vrefint, 1 is the actual adc value
-float y_n[4] = {0};
-float e_n[4] = {0};
-float vdda;
-float adc_Voltage;
+//int switching_frequency = 160000;
+uint16_t period; //the ARR register value. Clock freq/(arr+1)(prescaler+1) = pwm frequency
+uint16_t ADC_Val; //the value calculated by the ADC
+float y_n[4] = {0}; //duty cycle output and previous duty cycle outputs
+float e_n[4] = {0}; //error (vref - vmeasured). scaled by the ADC and resistor divider network feeding into ADC
+float Vin = 12.0;
+float integral = 0.0;
+float closed_loop_pulse;
+float v_error;
 uint16_t vrefint_cal;
-uint16_t pulse = 0;
-int incrementor;
-int decrementor;
-int maxPulse = 72;
-float maxDuty = 0.8;
-float vref = 0.466;
+uint16_t open_loop_pulse = 0; //the duty cycle
+uint16_t vref = 0; //the reference voltage to track scaled by the adc and resistor divider network. it starts@0 and goes up to the target value defined by PARAM_VREF
+uint16_t start_converter = 1; //start converter and is converter switching are variable to track the state of converter
+uint16_t converter_is_switching = 0; //start converter lets you, well, start the converter
+uint16_t open_loop_test = 0; //open loop lets you dictate whether you want to manually set the pwm value to a specific value or have it be determined by feedback loop
+void control_fast_loop();
+void compensator_reset();
+void PI_controller(float);
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) //this function is called when an ADC reading has been completed
+{
+	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, 1);
+	ADC_Val = HAL_ADC_GetValue(hadc);
+	control_fast_loop();
+	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, 0);
+}
 /* USER CODE END 0 */
 
 /**
@@ -99,7 +115,7 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-//HAL_Delay(20);
+//	vrefint_cal = *((uint16_t*)0x1FF80078);
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -125,65 +141,49 @@ int main(void)
   MX_ADC_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
-  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_4, 0);
-//  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_SET);
-  GPIOB->BSRR = GPIO_PIN_14;
+//      HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_SET);
+//      HAL_Delay(2000);
 
-  vrefint_cal = *((uint16_t*)0x1FF80078); //factory calibrated vref value
+//  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_4); //start the PWM from timer2 channel 4
+//  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_4, pulse);
+
+
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  HAL_ADC_Start_DMA(&hadc, (uint32_t*)ADC_Val, 2);
-      HAL_ADC_PollForConversion(&hadc, 1);
-      vdda = 3 * (float)(vrefint_cal)/ADC_Val[0]; //compute actual vdda based on vrefint
-      adc_Voltage = vdda * ADC_Val[1]/4096; //compute adc input based on actual vdda
-      y_n[3] = y_n[2]; //y_n[3] is yn-3. That's the sample taken three periods ago
-      y_n[2] = y_n[1]; //y is the output, or duty cycle, so next duty cycle is based on prev duty cycles
-      y_n[1]= y_n[0]; //each new cycle, the most recent becomes second most recent, 2nd most recent becomes 3rd most recent, etc.
+//below shows the logic to start the converter
+	  if(start_converter == 1){ //if
+		  if(converter_is_switching == 0){
+			  HAL_TIM_Base_Start(&htim2); //start the timer
+			  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_4); //start the PWM from timer2 channel 4
+			  if(open_loop_test == 1){
+				  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_4, open_loop_pulse);
+			  }
+			  converter_is_switching = 1;
+			  HAL_ADC_Start_IT(&hadc); // Start ADC Conversion using interrupt
+		  }
 
-      e_n[3] = e_n[2]; //e_n is error, this is the reference minus measured adc value
-      e_n[2] = e_n[1];
-      e_n[1] = e_n[0];
-
-      e_n[0] = vref - adc_Voltage;
-      y_n[0] = A1*y_n[1]+A2*y_n[2]+A3*y_n[3]+B0*e_n[0]+B1*e_n[1]+B2*e_n[2]+B3*e_n[3];
-      y_n[0]=y_n[0] * K;
-      if(y_n[0]<0){
-    	  y_n[0]=0;
-      }
-      if(y_n[0]>=maxDuty){
-    	  y_n[0] = maxDuty;
-      }
-      incrementor = vref - adc_Voltage > 0.02;
-      pulse = pulse + incrementor;
-      decrementor = adc_Voltage - vref > 0.02;
-      pulse = pulse - decrementor;
-      if(pulse>=maxPulse){
-    	  pulse=maxPulse;
-      }
-      if(pulse<0){
-    	  pulse = 0;
-      }
-      __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_4, 34);
-//      AD_RES = HAL_ADC_GetValue(&hadc);
-
-
-//      HAL_UART_Transmit(&huart1, (uint8_t));
-//	  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_SET);
-//	  HAL_Delay(500);
-//	  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_RESET);
-//	  HAL_Delay(500);
-//	  for(int i = 0; i<=*(&htim2.Init.Period);i++){
-//		  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_4, i);
-//		  HAL_Delay(20);
-//	  }
+	  }
+	  else{ //otherwise if start converter is set to false, meaning we don't want to start the converter
+		  //we stop the converter if it is running
+		  if(converter_is_switching==1){
+			  HAL_ADC_Stop_IT(&hadc);
+			  HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_4); //if converter is running we stop it by stopping the pwm
+			  converter_is_switching = 0;
+			  compensator_reset();
+			  vref = 0;
+			  integral = 0.0;
+		  }
+	  }
+	  }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-  }
+
   /* USER CODE END 3 */
 }
 
@@ -248,7 +248,7 @@ static void MX_ADC_Init(void)
   /** Configure the global features of the ADC (Clock, Resolution, Data Alignment and number of conversion)
   */
   hadc.Instance = ADC1;
-  hadc.Init.ClockPrescaler = ADC_CLOCK_ASYNC_DIV2;
+  hadc.Init.ClockPrescaler = ADC_CLOCK_ASYNC_DIV1;
   hadc.Init.Resolution = ADC_RESOLUTION_12B;
   hadc.Init.DataAlign = ADC_DATAALIGN_RIGHT;
   hadc.Init.ScanConvMode = ADC_SCAN_ENABLE;
@@ -256,11 +256,11 @@ static void MX_ADC_Init(void)
   hadc.Init.LowPowerAutoWait = ADC_AUTOWAIT_DISABLE;
   hadc.Init.LowPowerAutoPowerOff = ADC_AUTOPOWEROFF_DISABLE;
   hadc.Init.ChannelsBank = ADC_CHANNELS_BANK_A;
-  hadc.Init.ContinuousConvMode = ENABLE;
-  hadc.Init.NbrOfConversion = 2;
+  hadc.Init.ContinuousConvMode = DISABLE;
+  hadc.Init.NbrOfConversion = 1;
   hadc.Init.DiscontinuousConvMode = DISABLE;
-  hadc.Init.ExternalTrigConv = ADC_SOFTWARE_START;
-  hadc.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+  hadc.Init.ExternalTrigConv = ADC_EXTERNALTRIGCONV_T2_TRGO;
+  hadc.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_RISING;
   hadc.Init.DMAContinuousRequests = ENABLE;
   if (HAL_ADC_Init(&hadc) != HAL_OK)
   {
@@ -269,24 +269,14 @@ static void MX_ADC_Init(void)
 
   /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
   */
-  sConfig.Channel = ADC_CHANNEL_VREFINT;
-  sConfig.Rank = ADC_REGULAR_RANK_1;
-  sConfig.SamplingTime = ADC_SAMPLETIME_192CYCLES;
-  if (HAL_ADC_ConfigChannel(&hadc, &sConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
-  */
   sConfig.Channel = ADC_CHANNEL_18;
-  sConfig.Rank = ADC_REGULAR_RANK_2;
+  sConfig.Rank = ADC_REGULAR_RANK_1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_9CYCLES;
   if (HAL_ADC_ConfigChannel(&hadc, &sConfig) != HAL_OK)
   {
     Error_Handler();
   }
   /* USER CODE BEGIN ADC_Init 2 */
-
   /* USER CODE END ADC_Init 2 */
 
 }
@@ -312,10 +302,10 @@ static void MX_TIM2_Init(void)
   /* USER CODE END TIM2_Init 1 */
   htim2.Instance = TIM2;
   htim2.Init.Prescaler = 0;
-  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim2.Init.Period = period;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_CENTERALIGNED3;
+  htim2.Init.Period = 49;
   htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
   if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
   {
     Error_Handler();
@@ -329,14 +319,14 @@ static void MX_TIM2_Init(void)
   {
     Error_Handler();
   }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_UPDATE;
   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
   if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
   {
     Error_Handler();
   }
   sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  sConfigOC.Pulse = 14;
+  sConfigOC.Pulse = 21;
   sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
   if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_4) != HAL_OK)
@@ -344,7 +334,8 @@ static void MX_TIM2_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN TIM2_Init 2 */
-  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_4);
+  period = htim2.Init.Period;
+  open_loop_pulse = sConfigOC.Pulse;
   /* USER CODE END TIM2_Init 2 */
   HAL_TIM_MspPostInit(&htim2);
 
@@ -417,6 +408,9 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_RESET);
+
   /*Configure GPIO pins : PC13 PC14 PC15 */
   GPIO_InitStruct.Pin = GPIO_PIN_13|GPIO_PIN_14|GPIO_PIN_15;
   GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
@@ -440,15 +434,22 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /*Configure GPIO pins : PB0 PB1 PB2 PB10
-                           PB11 PB13 PB14 PB15
-                           PB3 PB4 PB5 PB6
-                           PB7 PB8 PB9 */
+                           PB11 PB13 PB15 PB3
+                           PB4 PB5 PB6 PB7
+                           PB8 PB9 */
   GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_10
-                          |GPIO_PIN_11|GPIO_PIN_13|GPIO_PIN_14|GPIO_PIN_15
-                          |GPIO_PIN_3|GPIO_PIN_4|GPIO_PIN_5|GPIO_PIN_6
-                          |GPIO_PIN_7|GPIO_PIN_8|GPIO_PIN_9;
+                          |GPIO_PIN_11|GPIO_PIN_13|GPIO_PIN_15|GPIO_PIN_3
+                          |GPIO_PIN_4|GPIO_PIN_5|GPIO_PIN_6|GPIO_PIN_7
+                          |GPIO_PIN_8|GPIO_PIN_9;
   GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : PB14 */
+  GPIO_InitStruct.Pin = GPIO_PIN_14;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
@@ -457,6 +458,71 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+//compensator function to initialize and reinitialize(reset) the compensator
+void compensator_reset(){
+		y_n[0] = 0.0;
+		y_n[1] = 0.0;
+		y_n[2] = 0.0;
+		y_n[3] = 0.0;
+		e_n[0]=0.0;
+		e_n[1]=0.0;
+		e_n[2]=0.0;
+		e_n[3]=0.0;
+}
+//step function performs math needed to calculate next output
+float compensator_step(float error){
+	e_n[0] = error;
+	y_n[0]=B0*e_n[0]+B1*e_n[1]+B2*e_n[2]+B3*e_n[3]+A1*y_n[1]+A2*y_n[2]+A3*y_n[3];
+	if(y_n[0]>DUTY_TICKS_MAX){
+		y_n[0]=DUTY_TICKS_MAX;
+	}
+	else if(y_n[0] < DUTY_TICKS_MIN){
+		y_n[0] = DUTY_TICKS_MIN;
+	}
+	else{
+		//nothing, MISRA compliance is a good thing ig
+	}
+	//next, update values so that current error error one cycle ago and so on
+	e_n[3] = e_n[2];
+	e_n[2] = e_n[1];
+	e_n[1] = e_n[0];
+	y_n[3] = y_n[2];
+	y_n[2] = y_n[1];
+	y_n[1] = y_n[0];
+	return y_n[0];
+}
+
+void control_fast_loop(){
+	if(converter_is_switching == 1){
+		if(vref < PARAM_VREF){
+			vref++; //the reference voltage, ramp that up until it reaches the target value of param_vref
+		}
+			v_error = vref - ADC_Val; //obtain verror
+//		closed_loop_pulse = compensator_step(v_error);
+//		closed_loop_pulse *=K_NO_PWM;
+		PI_controller(v_error);
+		if(open_loop_test==0){
+			__HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_4, (int)closed_loop_pulse);
+
+		}
+	}
+}
+void PI_controller(float error){
+	 float new_integral = integral + Ki * error;
+	 float output = Kp * error + new_integral;
+
+	    if(output > DUTY_TICKS_MAX){
+	        output = DUTY_TICKS_MAX;
+	    }
+	    else if(output < DUTY_TICKS_MIN){
+	        output = DUTY_TICKS_MIN;
+	    }
+	    else{
+	        integral = new_integral; // ONLY integrate if not saturated
+	    }
+
+	    closed_loop_pulse = output;
+}
 void control(void){
 
 }
