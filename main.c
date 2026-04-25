@@ -48,6 +48,9 @@
 #define PARAM_VREF 2482
 #define Kp 0.002
 #define Ki 0.00009
+#define KP_SCALED 2000
+#define KI_SCALED 90
+#define SCALE 1000000
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -89,23 +92,25 @@ float y_n[4] = {0}; //duty cycle output and previous duty cycle outputs
 float e_n[4] = {0}; //error (vref - vmeasured). scaled by the ADC and resistor divider network feeding into ADC
 float Vin = 12.0;
 float integral = 0.0;
-float closed_loop_pulse;
-float v_error;
-uint16_t period; //the ARR register value. Clock freq/(arr+1)(prescaler+1) = pwm frequency
-uint16_t ADC_Val[1]; //the value calculated by the ADC
-uint16_t ISR_Called=0;
-uint16_t vrefint_cal;
-uint16_t open_loop_pulse = 0; //the duty cycle
-uint16_t vref = 0; //the reference voltage to track scaled by the adc and resistor divider network. it starts@0 and goes up to the target value defined by PARAM_VREF
+int32_t closed_loop_pulse; //the pulse determined by the controller when in closed-feedback loop mode
+int32_t the_new_integral=0; //this term is being used for a new, hopefully faster PI controller
+int32_t new_PI_output = 0.0;
+const int32_t duty_ticks_max_scaled = SCALE*DUTY_TICKS_MAX;
+int32_t v_error;
+uint32_t period; //the ARR register value. Clock freq/(arr+1)(prescaler+1) = pwm frequency
+uint32_t ADC_Val[1]; //the value calculated by the ADC
+uint32_t vrefint_cal;
+uint32_t open_loop_pulse = 0; //the duty cycle
+uint32_t vref = 0; //the reference voltage to track scaled by the adc and resistor divider network. it starts@0 and goes up to the target value defined by PARAM_VREF
 uint16_t start_converter = 1; //start converter and is converter switching are variable to track the state of converter
 uint16_t converter_is_switching = 0; //start converter lets you, well, start the converter
-uint16_t open_loop_test = 1; //open loop lets you dictate whether you want to manually set the pwm value to a specific value or have it be determined by feedback loop
+uint16_t open_loop_test = 0; //open loop lets you dictate whether you want to manually set the pwm value to a specific value or have it be determined by feedback loop
 void control_fast_loop();
 void compensator_reset();
-void PI_controller(float);
+void PI_controller(int16_t);
+void new_PI_controller(int32_t);
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) //this function is called when an ADC reading has been completed
 {
-	ISR_Called=13;
 	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, 1); //toggles the LED that the pink waveform was measuring
 //	ADC_Val = HAL_ADC_GetValue(hadc); //obtain ADC value
 	control_fast_loop(); //run the PI controller
@@ -163,11 +168,12 @@ int main(void)
 			  HAL_TIM_Base_Start(&htim2); //start the timer
 			  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_4); //start the PWM from timer2 channel 4
 			  HAL_TIM_Base_Start(&htim3);
-			  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_4);
+			  HAL_TIM_OC_Start(&htim3, TIM_CHANNEL_4);
+//			  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_4);
 			  HAL_Delay(1000);
 			  if(open_loop_test == 1){
 			  				  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_4, open_loop_pulse);
-			  				  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_4, 200);
+//			  				  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_4, 200);
 			  }
 
 			  HAL_TIM_Base_Start(&htim4);
@@ -186,7 +192,8 @@ int main(void)
 			  converter_is_switching = 0;
 			  compensator_reset();
 			  vref = 0;
-			  integral = 0.0;
+//			  integral = 0.0;
+			  the_new_integral = 0;
 		  }
 	  }
 	  }
@@ -390,7 +397,7 @@ static void MX_TIM3_Init(void)
   {
     Error_Handler();
   }
-  if (HAL_TIM_PWM_Init(&htim3) != HAL_OK)
+  if (HAL_TIM_OC_Init(&htim3) != HAL_OK)
   {
     Error_Handler();
   }
@@ -406,11 +413,11 @@ static void MX_TIM3_Init(void)
   {
     Error_Handler();
   }
-  sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  sConfigOC.Pulse = 200;
+  sConfigOC.OCMode = TIM_OCMODE_TOGGLE;
+  sConfigOC.Pulse = 400;
   sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_4) != HAL_OK)
+  if (HAL_TIM_OC_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_4) != HAL_OK)
   {
     Error_Handler();
   }
@@ -628,28 +635,48 @@ void control_fast_loop(){
 			v_error = vref - ADC_Val[0]; //obtain verror
 //		closed_loop_pulse = compensator_step(v_error);
 //		closed_loop_pulse *=K_NO_PWM;
-		PI_controller(v_error);
+//		PI_controller(v_error);
+		new_PI_controller(v_error);
 		if(open_loop_test==0){
 			__HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_4, (int)closed_loop_pulse);
 
 		}
 	}
 }
-void PI_controller(float error){
-	 float new_integral = integral + Ki * error;
-	 float output = Kp * error + new_integral;
-
+void PI_controller(int16_t error){ //old PI controller uses floats and declares new each time, works, but suboptimal timing
+	 float new_integral = integral+(error*KI_SCALED); //update integral term (that already has all the past additions) with the newest addition
+	 float output = (KP_SCALED*error) + new_integral; //the output is now the P term + the I term
+//	 new_integral = new_integral/SCALE;
+	 output = output/SCALE;
 	    if(output > DUTY_TICKS_MAX){
-	        output = DUTY_TICKS_MAX;
+	        output = DUTY_TICKS_MAX; //if the output is saturated, keep it at saturation level
 	    }
-	    else if(output < DUTY_TICKS_MIN){
-	        output = DUTY_TICKS_MIN;
+	    else if(output < 0){
+	        output = 0; //don't let the output go below 0
 	    }
 	    else{
-	        integral = new_integral; // ONLY integrate if not saturated
+	        integral = new_integral; // if the output is at neither a min or max, then we add to the term that will add to the integral term
 	    }
-
+	    //so basically if we need to clamp the output on this cycle, we should not be adding to the integral term
 	    closed_loop_pulse = output;
+}
+void new_PI_controller(int32_t error){ //new PI_controller, uses only ints and scales them
+	the_new_integral+=KI_SCALED*error;
+	new_PI_output = (KP_SCALED*error) + the_new_integral;
+	//scale output correctly here
+//	new_PI_output = new_PI_output;
+	if(new_PI_output>duty_ticks_max_scaled){
+		new_PI_output = duty_ticks_max_scaled;
+		the_new_integral -= KI_SCALED*error;
+	}
+	else if(new_PI_output < 0){ //if we do clamp the output, the current integral term, KI*error, should not be factored into the total integral term for the next loop.
+		new_PI_output = 0;
+		the_new_integral -=KI_SCALED*error;
+	}
+	else{ //if we don't need to clamp the output, ie, it is behaving, then we can factor the current integral term into the next integral term
+		//nothing here
+	}
+	closed_loop_pulse = new_PI_output/SCALE;
 }
 void control(void){
 
