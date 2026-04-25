@@ -44,10 +44,10 @@
 #define K (+0.001007325)
 #define K_NO_PWM (0.41972)
 #define DUTY_TICKS_MIN (0)
-#define DUTY_TICKS_MAX (40) //given by 0.8*arr_val (which is 50)
+#define DUTY_TICKS_MAX (80) //given by 0.8*arr_val (which is 100)
 #define PARAM_VREF 2482
-#define Kp 0.0015
-#define Ki 0.00003
+#define Kp 0.002
+#define Ki 0.00009
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -60,6 +60,8 @@ ADC_HandleTypeDef hadc;
 DMA_HandleTypeDef hdma_adc;
 
 TIM_HandleTypeDef htim2;
+TIM_HandleTypeDef htim3;
+TIM_HandleTypeDef htim4;
 
 UART_HandleTypeDef huart1;
 
@@ -74,6 +76,8 @@ static void MX_DMA_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_ADC_Init(void);
 static void MX_USART1_UART_Init(void);
+static void MX_TIM3_Init(void);
+static void MX_TIM4_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -81,28 +85,30 @@ static void MX_USART1_UART_Init(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 //int switching_frequency = 160000;
-uint16_t period; //the ARR register value. Clock freq/(arr+1)(prescaler+1) = pwm frequency
-uint16_t ADC_Val; //the value calculated by the ADC
 float y_n[4] = {0}; //duty cycle output and previous duty cycle outputs
 float e_n[4] = {0}; //error (vref - vmeasured). scaled by the ADC and resistor divider network feeding into ADC
 float Vin = 12.0;
 float integral = 0.0;
 float closed_loop_pulse;
 float v_error;
+uint16_t period; //the ARR register value. Clock freq/(arr+1)(prescaler+1) = pwm frequency
+uint16_t ADC_Val[1]; //the value calculated by the ADC
+uint16_t ISR_Called=0;
 uint16_t vrefint_cal;
 uint16_t open_loop_pulse = 0; //the duty cycle
 uint16_t vref = 0; //the reference voltage to track scaled by the adc and resistor divider network. it starts@0 and goes up to the target value defined by PARAM_VREF
 uint16_t start_converter = 1; //start converter and is converter switching are variable to track the state of converter
 uint16_t converter_is_switching = 0; //start converter lets you, well, start the converter
-uint16_t open_loop_test = 0; //open loop lets you dictate whether you want to manually set the pwm value to a specific value or have it be determined by feedback loop
+uint16_t open_loop_test = 1; //open loop lets you dictate whether you want to manually set the pwm value to a specific value or have it be determined by feedback loop
 void control_fast_loop();
 void compensator_reset();
 void PI_controller(float);
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) //this function is called when an ADC reading has been completed
 {
-	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, 1);
-	ADC_Val = HAL_ADC_GetValue(hadc);
-	control_fast_loop();
+	ISR_Called=13;
+	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, 1); //toggles the LED that the pink waveform was measuring
+//	ADC_Val = HAL_ADC_GetValue(hadc); //obtain ADC value
+	control_fast_loop(); //run the PI controller
 	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, 0);
 }
 /* USER CODE END 0 */
@@ -140,13 +146,9 @@ int main(void)
   MX_TIM2_Init();
   MX_ADC_Init();
   MX_USART1_UART_Init();
+  MX_TIM3_Init();
+  MX_TIM4_Init();
   /* USER CODE BEGIN 2 */
-//      HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_SET);
-//      HAL_Delay(2000);
-
-//  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_4); //start the PWM from timer2 channel 4
-//  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_4, pulse);
-
 
 
   /* USER CODE END 2 */
@@ -160,11 +162,19 @@ int main(void)
 		  if(converter_is_switching == 0){
 			  HAL_TIM_Base_Start(&htim2); //start the timer
 			  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_4); //start the PWM from timer2 channel 4
+			  HAL_TIM_Base_Start(&htim3);
+			  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_4);
+			  HAL_Delay(1000);
 			  if(open_loop_test == 1){
-				  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_4, open_loop_pulse);
+			  				  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_4, open_loop_pulse);
+			  				  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_4, 200);
 			  }
+
+			  HAL_TIM_Base_Start(&htim4);
+
 			  converter_is_switching = 1;
-			  HAL_ADC_Start_IT(&hadc); // Start ADC Conversion using interrupt
+//			  HAL_ADC_Start_IT(&hadc); // Start ADC Conversion using interrupt
+			  HAL_ADC_Start_DMA(&hadc, (uint32_t*)ADC_Val, 1);
 		  }
 
 	  }
@@ -206,7 +216,10 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
-  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL4;
+  RCC_OscInitStruct.PLL.PLLDIV = RCC_PLL_DIV2;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
     Error_Handler();
@@ -216,12 +229,12 @@ void SystemClock_Config(void)
   */
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
-  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_1) != HAL_OK)
   {
     Error_Handler();
   }
@@ -259,7 +272,7 @@ static void MX_ADC_Init(void)
   hadc.Init.ContinuousConvMode = DISABLE;
   hadc.Init.NbrOfConversion = 1;
   hadc.Init.DiscontinuousConvMode = DISABLE;
-  hadc.Init.ExternalTrigConv = ADC_EXTERNALTRIGCONV_T2_TRGO;
+  hadc.Init.ExternalTrigConv = ADC_EXTERNALTRIGCONV_T3_TRGO;
   hadc.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_RISING;
   hadc.Init.DMAContinuousRequests = ENABLE;
   if (HAL_ADC_Init(&hadc) != HAL_OK)
@@ -271,7 +284,7 @@ static void MX_ADC_Init(void)
   */
   sConfig.Channel = ADC_CHANNEL_18;
   sConfig.Rank = ADC_REGULAR_RANK_1;
-  sConfig.SamplingTime = ADC_SAMPLETIME_9CYCLES;
+  sConfig.SamplingTime = ADC_SAMPLETIME_4CYCLES;
   if (HAL_ADC_ConfigChannel(&hadc, &sConfig) != HAL_OK)
   {
     Error_Handler();
@@ -294,6 +307,7 @@ static void MX_TIM2_Init(void)
   /* USER CODE END TIM2_Init 0 */
 
   TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_SlaveConfigTypeDef sSlaveConfig = {0};
   TIM_MasterConfigTypeDef sMasterConfig = {0};
   TIM_OC_InitTypeDef sConfigOC = {0};
 
@@ -303,7 +317,7 @@ static void MX_TIM2_Init(void)
   htim2.Instance = TIM2;
   htim2.Init.Prescaler = 0;
   htim2.Init.CounterMode = TIM_COUNTERMODE_CENTERALIGNED3;
-  htim2.Init.Period = 49;
+  htim2.Init.Period = 100;
   htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
   if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
@@ -319,14 +333,20 @@ static void MX_TIM2_Init(void)
   {
     Error_Handler();
   }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_UPDATE;
+  sSlaveConfig.SlaveMode = TIM_SLAVEMODE_TRIGGER;
+  sSlaveConfig.InputTrigger = TIM_TS_ITR3;
+  if (HAL_TIM_SlaveConfigSynchro(&htim2, &sSlaveConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
   if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
   {
     Error_Handler();
   }
   sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  sConfigOC.Pulse = 21;
+  sConfigOC.Pulse = 40;
   sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
   if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_4) != HAL_OK)
@@ -338,6 +358,114 @@ static void MX_TIM2_Init(void)
   open_loop_pulse = sConfigOC.Pulse;
   /* USER CODE END TIM2_Init 2 */
   HAL_TIM_MspPostInit(&htim2);
+
+}
+
+/**
+  * @brief TIM3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM3_Init(void)
+{
+
+  /* USER CODE BEGIN TIM3_Init 0 */
+
+  /* USER CODE END TIM3_Init 0 */
+
+  TIM_SlaveConfigTypeDef sSlaveConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+
+  /* USER CODE BEGIN TIM3_Init 1 */
+
+  /* USER CODE END TIM3_Init 1 */
+  htim3.Instance = TIM3;
+  htim3.Init.Prescaler = 0;
+  htim3.Init.CounterMode = TIM_COUNTERMODE_CENTERALIGNED3;
+  htim3.Init.Period = 400;
+  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+  if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_Init(&htim3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sSlaveConfig.SlaveMode = TIM_SLAVEMODE_TRIGGER;
+  sSlaveConfig.InputTrigger = TIM_TS_ITR3;
+  if (HAL_TIM_SlaveConfigSynchro(&htim3, &sSlaveConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_OC1;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 200;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM3_Init 2 */
+
+  /* USER CODE END TIM3_Init 2 */
+  HAL_TIM_MspPostInit(&htim3);
+
+}
+
+/**
+  * @brief TIM4 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM4_Init(void)
+{
+
+  /* USER CODE BEGIN TIM4_Init 0 */
+
+  /* USER CODE END TIM4_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+
+  /* USER CODE BEGIN TIM4_Init 1 */
+
+  /* USER CODE END TIM4_Init 1 */
+  htim4.Instance = TIM4;
+  htim4.Init.Prescaler = 0;
+  htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim4.Init.Period = 99;
+  htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim4.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_PWM_Init(&htim4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_UPDATE;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim4, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_PWM_ConfigChannel(&htim4, &sConfigOC, TIM_CHANNEL_4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM4_Init 2 */
+
+  /* USER CODE END TIM4_Init 2 */
 
 }
 
@@ -433,14 +561,14 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : PB0 PB1 PB2 PB10
-                           PB11 PB13 PB15 PB3
-                           PB4 PB5 PB6 PB7
-                           PB8 PB9 */
-  GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_10
-                          |GPIO_PIN_11|GPIO_PIN_13|GPIO_PIN_15|GPIO_PIN_3
-                          |GPIO_PIN_4|GPIO_PIN_5|GPIO_PIN_6|GPIO_PIN_7
-                          |GPIO_PIN_8|GPIO_PIN_9;
+  /*Configure GPIO pins : PB0 PB2 PB10 PB11
+                           PB13 PB15 PB3 PB4
+                           PB5 PB6 PB7 PB8
+                           PB9 */
+  GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_2|GPIO_PIN_10|GPIO_PIN_11
+                          |GPIO_PIN_13|GPIO_PIN_15|GPIO_PIN_3|GPIO_PIN_4
+                          |GPIO_PIN_5|GPIO_PIN_6|GPIO_PIN_7|GPIO_PIN_8
+                          |GPIO_PIN_9;
   GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
@@ -497,7 +625,7 @@ void control_fast_loop(){
 		if(vref < PARAM_VREF){
 			vref++; //the reference voltage, ramp that up until it reaches the target value of param_vref
 		}
-			v_error = vref - ADC_Val; //obtain verror
+			v_error = vref - ADC_Val[0]; //obtain verror
 //		closed_loop_pulse = compensator_step(v_error);
 //		closed_loop_pulse *=K_NO_PWM;
 		PI_controller(v_error);
