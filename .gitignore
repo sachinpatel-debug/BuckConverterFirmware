@@ -1,0 +1,10 @@
+# Build directories
+Debug/
+Release/
+
+# Toolchain / IDE files (User specific)
+.settings/
+*.launch
+
+# Auto-generated CubeMX tracking
+.mxproject
