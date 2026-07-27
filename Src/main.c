@@ -24,6 +24,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "compensator.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -34,23 +35,16 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 //#define VREFINT_CAL_ADDR ((uint16_t*) ((uint32_t)0x1FF80078))
-#define B0 (+0.072843308)
-#define B1 (-0.068984401)
-#define B2 (-0.072799692)
-#define B3 (+0.069028018)
-#define A1 (+.100346303)
-#define A2 (0.004660361)  //I have scaled everything by 1/10
-#define A3 (-0.005006664)
-#define K (+0.001007325)
+
 #define K_NO_PWM (0.41972)
 #define DUTY_TICKS_MIN (0)
 #define DUTY_TICKS_MAX (80) //given by 0.8*arr_val (which is 100)
-#define PARAM_VREF 2482
+#define SCALE (1 << 20)
 #define Kp 0.002
 #define Ki 0.00009
-#define KP_SCALED 2000
-#define KI_SCALED 90
-#define SCALE 1000000
+#define KP_SCALED (uint32_t)(Kp * SCALE)
+#define KI_SCALED (uint32_t)(Ki * SCALE)
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -190,7 +184,7 @@ int main(void)
 			  HAL_ADC_Stop_IT(&hadc);
 			  HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_4); //if converter is running we stop it by stopping the pwm
 			  converter_is_switching = 0;
-			  compensator_reset();
+//			  compensator_reset();
 			  vref = 0;
 //			  integral = 0.0;
 			  the_new_integral = 0;
@@ -346,7 +340,7 @@ static void MX_TIM2_Init(void)
   {
     Error_Handler();
   }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_UPDATE;
   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
   if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
   {
@@ -414,7 +408,7 @@ static void MX_TIM3_Init(void)
     Error_Handler();
   }
   sConfigOC.OCMode = TIM_OCMODE_TOGGLE;
-  sConfigOC.Pulse = 200;
+  sConfigOC.Pulse = 100;
   sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
   if (HAL_TIM_OC_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_4) != HAL_OK)
@@ -593,46 +587,14 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-//compensator function to initialize and reinitialize(reset) the compensator
-void compensator_reset(){
-		y_n[0] = 0.0;
-		y_n[1] = 0.0;
-		y_n[2] = 0.0;
-		y_n[3] = 0.0;
-		e_n[0]=0.0;
-		e_n[1]=0.0;
-		e_n[2]=0.0;
-		e_n[3]=0.0;
-}
-//step function performs math needed to calculate next output
-float compensator_step(float error){
-	e_n[0] = error;
-	y_n[0]=B0*e_n[0]+B1*e_n[1]+B2*e_n[2]+B3*e_n[3]+A1*y_n[1]+A2*y_n[2]+A3*y_n[3];
-	if(y_n[0]>DUTY_TICKS_MAX){
-		y_n[0]=DUTY_TICKS_MAX;
-	}
-	else if(y_n[0] < DUTY_TICKS_MIN){
-		y_n[0] = DUTY_TICKS_MIN;
-	}
-	else{
-		//nothing, MISRA compliance is a good thing ig
-	}
-	//next, update values so that current error error one cycle ago and so on
-	e_n[3] = e_n[2];
-	e_n[2] = e_n[1];
-	e_n[1] = e_n[0];
-	y_n[3] = y_n[2];
-	y_n[2] = y_n[1];
-	y_n[1] = y_n[0];
-	return y_n[0];
-}
+
 
 void control_fast_loop(){
 	if(converter_is_switching == 1){
 		if(vref < PARAM_VREF){
 			vref++; //the reference voltage, ramp that up until it reaches the target value of param_vref
 		}
-			v_error = vref - ADC_Val[0]; //obtain verror
+		v_error = vref - ADC_Val[0]; //obtain verror
 //		closed_loop_pulse = compensator_step(v_error);
 //		closed_loop_pulse *=K_NO_PWM;
 //		PI_controller(v_error);
@@ -643,23 +605,7 @@ void control_fast_loop(){
 		}
 	}
 }
-void PI_controller(int16_t error){ //old PI controller uses floats and declares new each time, works, but suboptimal timing
-	 float new_integral = integral+(error*KI_SCALED); //update integral term (that already has all the past additions) with the newest addition
-	 float output = (KP_SCALED*error) + new_integral; //the output is now the P term + the I term
-//	 new_integral = new_integral/SCALE;
-	 output = output/SCALE;
-	    if(output > DUTY_TICKS_MAX){
-	        output = DUTY_TICKS_MAX; //if the output is saturated, keep it at saturation level
-	    }
-	    else if(output < 0){
-	        output = 0; //don't let the output go below 0
-	    }
-	    else{
-	        integral = new_integral; // if the output is at neither a min or max, then we add to the term that will add to the integral term
-	    }
-	    //so basically if we need to clamp the output on this cycle, we should not be adding to the integral term
-	    closed_loop_pulse = output;
-}
+
 void new_PI_controller(int32_t error){ //new PI_controller, uses only ints and scales them
 	the_new_integral+=KI_SCALED*error;
 	new_PI_output = (KP_SCALED*error) + the_new_integral;
