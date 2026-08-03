@@ -14,6 +14,7 @@ struct type3_COMP {
 	uint32_t min_val;
 	uint32_t max_val;
 	uint32_t float_to_int_scaler;
+	int32_t rem;
 };
 
 /*
@@ -32,4 +33,4 @@ void compensator_reset(struct type3_COMP* comp);
  * @param the error signal (vref - vout) on the adc scale
  * @return the duty cycle
  */
-uint32_t compensator_step(struct type3_COMP* comp, int32_t error);
+uint32_t compensator_step(struct type3_COMP* comp);

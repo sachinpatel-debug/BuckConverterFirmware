@@ -24,6 +24,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "control_params.h"
 #include "compensator.h"
 /* USER CODE END Includes */
 
@@ -36,7 +37,6 @@
 /* USER CODE BEGIN PD */
 //#define VREFINT_CAL_ADDR ((uint16_t*) ((uint32_t)0x1FF80078))
 
-#define K_NO_PWM (0.41972)
 #define DUTY_TICKS_MIN (0)
 #define DUTY_TICKS_MAX (80) //given by 0.8*arr_val (which is 100)
 #define SCALE (1 << 20)
@@ -44,6 +44,7 @@
 #define Ki 0.00009
 #define KP_SCALED (uint32_t)(Kp * SCALE)
 #define KI_SCALED (uint32_t)(Ki * SCALE)
+#define SOFT_START_PRESCALER (2)
 
 /* USER CODE END PD */
 
@@ -99,6 +100,8 @@ uint32_t vref = 0; //the reference voltage to track scaled by the adc and resist
 uint16_t start_converter = 1; //start converter and is converter switching are variable to track the state of converter
 uint16_t converter_is_switching = 0; //start converter lets you, well, start the converter
 uint16_t open_loop_test = 0; //open loop lets you dictate whether you want to manually set the pwm value to a specific value or have it be determined by feedback loop
+uint32_t soft_start_divider = 0;
+struct type3_COMP type_three_compensator = {0};
 void control_fast_loop();
 void compensator_reset();
 void PI_controller(int16_t);
@@ -106,7 +109,6 @@ void new_PI_controller(int32_t);
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) //this function is called when an ADC reading has been completed
 {
 	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, 1); //toggles the LED that the pink waveform was measuring
-//	ADC_Val = HAL_ADC_GetValue(hadc); //obtain ADC value
 	control_fast_loop(); //run the PI controller
 	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, 0);
 }
@@ -148,7 +150,7 @@ int main(void)
   MX_TIM3_Init();
   MX_TIM4_Init();
   /* USER CODE BEGIN 2 */
-
+  compensator_init(&type_three_compensator);
 
   /* USER CODE END 2 */
 
@@ -157,7 +159,21 @@ int main(void)
   while (1)
   {
 //below shows the logic to start the converter
-	  if(start_converter == 1){ //if
+//	  soft_start_divider += 1;
+//	  if(soft_start_divider>= SOFT_START_PRESCALER)
+//	  {
+		  if(vref < PARAM_VREF)
+		  {
+		  vref = vref + 1;
+		  }
+		  if(type_three_compensator.max_val < MAX_COMP_VAL)
+		  {
+			  type_three_compensator.max_val = 0 + (90 * vref) / PARAM_VREF;  // 20% → 90% as vref rises
+		  }
+//		  soft_start_divider = 0;
+//	  }
+
+	  if(start_converter == 1){
 		  if(converter_is_switching == 0){
 			  HAL_TIM_Base_Start(&htim2); //start the timer
 			  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_4); //start the PWM from timer2 channel 4
@@ -166,19 +182,17 @@ int main(void)
 //			  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_4);
 			  HAL_Delay(1000);
 			  if(open_loop_test == 1){
-			  				  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_4, open_loop_pulse);
-//			  				  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_4, 200);
+				  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_4, open_loop_pulse);
 			  }
 
 			  HAL_TIM_Base_Start(&htim4);
 
 			  converter_is_switching = 1;
-//			  HAL_ADC_Start_IT(&hadc); // Start ADC Conversion using interrupt
 			  HAL_ADC_Start_DMA(&hadc, (uint32_t*)ADC_Val, 1);
 		  }
 
 	  }
-	  else{ //otherwise if start converter is set to false, meaning we don't want to start the converter
+	  else { //otherwise if start converter is set to false, meaning we don't want to start the converter
 		  //we stop the converter if it is running
 		  if(converter_is_switching==1){
 			  HAL_ADC_Stop_IT(&hadc);
@@ -347,7 +361,7 @@ static void MX_TIM2_Init(void)
     Error_Handler();
   }
   sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  sConfigOC.Pulse = 40;
+  sConfigOC.Pulse = 0;
   sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
   if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_4) != HAL_OK)
@@ -590,20 +604,9 @@ static void MX_GPIO_Init(void)
 
 
 void control_fast_loop(){
-	if(converter_is_switching == 1){
-		if(vref < PARAM_VREF){
-			vref++; //the reference voltage, ramp that up until it reaches the target value of param_vref
-		}
-		v_error = vref - ADC_Val[0]; //obtain verror
-//		closed_loop_pulse = compensator_step(v_error);
-//		closed_loop_pulse *=K_NO_PWM;
-//		PI_controller(v_error);
-		new_PI_controller(v_error);
-		if(open_loop_test==0){
-			__HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_4, (int)closed_loop_pulse);
-
-		}
-	}
+		type_three_compensator.x[0] = PARAM_VREF - ADC_Val[0]; //obtain verror
+//		new_PI_controller(v_error);
+			__HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_4, compensator_step(&type_three_compensator));
 }
 
 void new_PI_controller(int32_t error){ //new PI_controller, uses only ints and scales them
